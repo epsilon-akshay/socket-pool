@@ -12,19 +12,22 @@ import (
 )
 
 type Pool struct {
-	connections map[int]*WrapperConn
-	mutex       sync.Mutex
-	idleConn    chan int
-	maxConn     int
-	connTimeout time.Duration
+	connections     map[int]*WrapperConn
+	mutex           sync.Mutex
+	idleConn        chan int
+	maxConn         int
+	idleConnTimeout time.Duration
+	connTimeout     time.Duration
 }
 
 type WrapperConn struct {
-	id         int
-	Conn       net.Conn
-	ConnReader *bufio.Reader
-	ConnWriter *bufio.Writer
-	IsActive   bool
+	id            int
+	Conn          net.Conn
+	ConnReader    *bufio.Reader
+	ConnWriter    *bufio.Writer
+	IsActive      bool
+	idleConnTimer *time.Timer
+	pool          *Pool
 }
 
 func push(idleConn chan int, id int) {
@@ -34,12 +37,13 @@ func push(idleConn chan int, id int) {
 func main() {
 	// Connect to the server on port 8080.
 	pool := &Pool{}
+
 	pool.mutex = sync.Mutex{}
 	pool.maxConn = 3
 	pool.connections = make(map[int]*WrapperConn)
 	pool.idleConn = make(chan int, pool.maxConn)
-	pool.connTimeout = 10 * time.Second
-
+	pool.connTimeout = 3 * time.Second
+	pool.idleConnTimeout = 3 * time.Second
 	wg := &sync.WaitGroup{}
 	errChan := make(chan error)
 	for i := 0; i < 10; i++ {
@@ -51,6 +55,7 @@ func main() {
 	for _, v := range pool.connections {
 		v.Conn.Close()
 	}
+	time.Sleep(20 * time.Second)
 }
 
 func waitOrGetIdle(pool *Pool) (*WrapperConn, error) {
@@ -58,9 +63,11 @@ func waitOrGetIdle(pool *Pool) (*WrapperConn, error) {
 	defer pool.mutex.Unlock()
 
 	select {
+
 	case lastConnId := <-pool.idleConn:
 		fmt.Println("found conn")
 		pool.connections[lastConnId].IsActive = true
+		pool.connections[lastConnId].idleConnTimer.Reset(pool.idleConnTimeout)
 		return pool.connections[lastConnId], nil
 	case <-time.After(pool.connTimeout):
 		fmt.Println("oh nooo")
@@ -86,15 +93,27 @@ func addAndGet(pool *Pool) (*WrapperConn, error) {
 		ConnReader: bufio.NewReader(newconn),
 		ConnWriter: bufio.NewWriter(newconn),
 		IsActive:   true,
+		pool:       pool,
 	}
+	wc.idleConnTimer = time.AfterFunc(pool.idleConnTimeout, wc.closeConn)
 	pool.connections[wc.id] = wc
 	return wc, nil
 }
 
 func setIdle(pool *Pool, id int) {
-	//TODO: think of critical section here
 	pool.connections[id].IsActive = false
 	push(pool.idleConn, id)
+
+}
+
+func (wc *WrapperConn) closeConn() {
+	fmt.Println("closing connection woooho")
+	wc.pool.mutex.Lock()
+	delete(wc.pool.connections, wc.id)
+	wc.pool.mutex.Unlock()
+
+	wc.Conn.Close()
+
 }
 
 func connectAndWriteWithoutPool(message string, wg *sync.WaitGroup, conn net.Conn, id int) {
